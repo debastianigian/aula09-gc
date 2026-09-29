@@ -1,0 +1,117 @@
+# Salvar em: .github/workflows/deploy.yml
+#
+# Pipeline de publicação do "sistema" (index.html) no Netlify.
+# Componentes de pipeline:
+#   EVENTO      -> on: (pull_request / push na main / manual)
+#   VERIFICAÇÃO -> job "build", steps de validação (vira status check obrigatório na PR)
+#   BUILD       -> job "build", gera o artefato em dist/ com a versão carimbada
+#   PUBLICAÇÃO  -> job "deploy", netlify deploy --prod autenticado por secrets
+#   REGISTRO    -> histórico de runs no Actions + Environment "production" + mensagem do deploy no Netlify
+
+name: CI/CD - Deploy Netlify
+
+on:
+  pull_request:
+    branches: [main]      # roda só a verificação (status check da PR)
+  push:
+    branches: [main]      # merge da PR gera push na main -> build + deploy
+  workflow_dispatch:      # permite rodar manualmente pela aba Actions
+
+permissions:
+  contents: read
+
+# Evita dois deploys de produção simultâneos
+concurrency:
+  group: producao-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verificar sistema (index.html)
+        run: |
+          test -s index.html || { echo "::error::index.html ausente ou vazio"; exit 1; }
+          grep -qi "<html" index.html || { echo "::error::index.html sem tag <html>"; exit 1; }
+          echo "Verificação OK"
+
+      - name: Build do artefato (dist/)
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          mkdir -p dist
+          cp index.html dist/index.html
+          DATA=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Carimba a versão no próprio sistema (rastreabilidade a partir da produção)
+          sed -i \
+            -e "s|__COMMIT_SHA__|${GITHUB_SHA}|g" \
+            -e "s|__COMMIT_SHORT__|${GITHUB_SHA::7}|g" \
+            -e "s|__RUN_ID__|${GITHUB_RUN_ID}|g" \
+            -e "s|__REPO_URL__|${REPO_URL}|g" \
+            -e "s|__BUILD_DATE__|${DATA}|g" \
+            dist/index.html
+          # Versão também em formato de máquina
+          cat > dist/version.json <<EOF
+          {
+            "commit": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_url": "${REPO_URL}/actions/runs/${GITHUB_RUN_ID}",
+            "commit_url": "${REPO_URL}/commit/${GITHUB_SHA}",
+            "build_date": "${DATA}"
+          }
+          EOF
+          ls -la dist
+
+      - name: Publicar artefato do build
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: dist/
+          retention-days: 7
+
+  deploy:
+    name: deploy
+    needs: build
+    # Só publica em produção quando o código chegou na main (nunca em PR)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.netlify.outputs.url }}
+    steps:
+      - name: Baixar artefato do build
+        uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: dist
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy no Netlify (produção)
+        id: netlify
+        env:
+          # O Netlify CLI lê essas variáveis automaticamente (não precisa de --auth/--site na linha de comando)
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          # Mensagem do commit via env (evita injeção de comando no shell)
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          TITULO=$(printf '%s' "$COMMIT_MSG" | head -n1)
+          npx --yes netlify-cli deploy \
+            --dir=dist \
+            --prod \
+            --message "${GITHUB_SHA::7} | run ${GITHUB_RUN_ID} | ${TITULO}" \
+            --json > deploy.json
+          URL=$(node -e "const d=require('./deploy.json'); console.log(d.url || d.deploy_url)")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "### Deploy em produção concluído" >> "$GITHUB_STEP_SUMMARY"
+          echo "- URL: $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
